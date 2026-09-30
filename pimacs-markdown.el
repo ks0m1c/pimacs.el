@@ -38,6 +38,22 @@
   (cl-loop for index below (treesit-node-child-count node t)
            collect (treesit-node-child node index t)))
 
+(defun pimacs--markdown-node-children-after (node position)
+  "Return the children of NODE whose end is after POSITION.
+Siblings are ordered, so locate the first candidate with a binary
+search instead of walking every sibling on each streamed delta."
+  (let* ((count (treesit-node-child-count node t))
+         (low 0)
+         (high count))
+    (while (< low high)
+      (let* ((middle (/ (+ low high) 2))
+             (child (treesit-node-child node middle t)))
+        (if (and child (> (treesit-node-end child) position))
+            (setq high middle)
+          (setq low (1+ middle)))))
+    (cl-loop for index from low below count
+             collect (treesit-node-child node index t))))
+
 (defun pimacs--markdown-node-children-without-types (node types)
   (cl-remove-if (lambda (child)
                   (member (treesit-node-type child) types))
@@ -513,18 +529,17 @@ When non-nil, diagnostics are appended to the temporary buffer
     (cl-labels ((append-text (text)
                   (push text chunks)
                   (cl-incf length (length text))))
-      (dolist (child (pimacs--markdown-node-children section))
-        (when (> (treesit-node-end child) start)
-          (when (< (treesit-node-start child) start)
-            (error "Markdown checkpoint is not at a section block boundary"))
-          (append-text
-           (buffer-substring-no-properties position (treesit-node-start child)))
-          (unless (= (treesit-node-start child) (treesit-node-start section))
-            (push (pimacs--markdown-make-render-checkpoint
-                   child (+ output-offset length))
-                  checkpoints))
-          (append-text (pimacs--markdown-render-block-node child context))
-          (setq position (treesit-node-end child))))
+      (dolist (child (pimacs--markdown-node-children-after section start))
+        (when (< (treesit-node-start child) start)
+          (error "Markdown checkpoint is not at a section block boundary"))
+        (append-text
+         (buffer-substring-no-properties position (treesit-node-start child)))
+        (unless (= (treesit-node-start child) (treesit-node-start section))
+          (push (pimacs--markdown-make-render-checkpoint
+                 child (+ output-offset length))
+                checkpoints))
+        (append-text (pimacs--markdown-render-block-node child context))
+        (setq position (treesit-node-end child)))
       (append-text
        (buffer-substring-no-properties position (treesit-node-end section)))
       (list (apply #'concat (nreverse chunks)) (nreverse checkpoints)))))
@@ -579,21 +594,20 @@ When non-nil, diagnostics are appended to the temporary buffer
           (progn
             (when leading-newline-p
               (append-text "\n"))
-            (dolist (node (pimacs--markdown-node-children root))
-              (when (> (treesit-node-end node) start)
-                (cond
-                 ((>= (treesit-node-start node) start)
-                  (append-text
-                   (buffer-substring-no-properties position
-                                                   (treesit-node-start node)))
-                  (push (pimacs--markdown-make-render-checkpoint
-                         node (+ output-offset length))
-                        checkpoints)
-                  (render-node node))
-                 ((string= (treesit-node-type node) "section")
-                  (render-node node))
-                 (t
-                  (error "Markdown checkpoint is not at a top-level block boundary")))))
+            (dolist (node (pimacs--markdown-node-children-after root start))
+              (cond
+               ((>= (treesit-node-start node) start)
+                (append-text
+                 (buffer-substring-no-properties position
+                                                 (treesit-node-start node)))
+                (push (pimacs--markdown-make-render-checkpoint
+                       node (+ output-offset length))
+                      checkpoints)
+                (render-node node))
+               ((string= (treesit-node-type node) "section")
+                (render-node node))
+               (t
+                (error "Markdown checkpoint is not at a top-level block boundary"))))
             (append-text (buffer-substring-no-properties position (point-max)))
             (list (apply #'concat (nreverse chunks)) (nreverse checkpoints)))
         (pimacs--markdown-delete-inline-parser-pool inline-state)))))
@@ -607,15 +621,18 @@ When non-nil, diagnostics are appended to the temporary buffer
       (error "Invalid Markdown render checkpoint"))
     (pcase-let ((`(,rendered ,checkpoints)
                  (pimacs--markdown-render-top-level session root start offset)))
-      (let ((before (cl-remove-if
-                     (lambda (item)
-                       (>= (marker-position
-                            (pimacs--markdown-render-checkpoint-marker item))
-                           start))
-                     (pimacs--markdown-render-session-checkpoints session))))
-        (pimacs--markdown-clear-checkpoints
-         (cl-set-difference (pimacs--markdown-render-session-checkpoints session)
-                            before))
+      (let* ((all (pimacs--markdown-render-session-checkpoints session))
+             (before (cl-loop for item in all
+                              until (>= (marker-position
+                                        (pimacs--markdown-render-checkpoint-marker item))
+                                      start)
+                              collect item))
+             (dropped (cl-loop for item in all
+                               when (>= (marker-position
+                                         (pimacs--markdown-render-checkpoint-marker item))
+                                       start)
+                               collect item)))
+        (pimacs--markdown-clear-checkpoints dropped)
         (setf (pimacs--markdown-render-session-checkpoints session)
               (append before checkpoints)
               (pimacs--markdown-render-session-rendered-length session)
@@ -794,7 +811,16 @@ When non-nil, diagnostics are appended to the temporary buffer
             (let* ((root (treesit-parser-root-node parser))
                    (raw-ranges
                     (pimacs--markdown-render-session-changed-ranges session))
-                   (definitions (pimacs--markdown-reference-definitions root))
+                   (definitions
+                    ;; Appending can only add a link reference definition, and a
+                    ;; definition needs one of these characters before it can
+                    ;; become complete.  The `:final' render still does the
+                    ;; authoritative full pass, so a missed or stale definition
+                    ;; is corrected when the message finishes.
+                    (if (string-match-p "[]:\n]" text)
+                        (pimacs--markdown-reference-definitions root)
+                      (pimacs--markdown-render-session-reference-definitions
+                       session)))
                    (references-changed
                     (not (equal definitions
                                 (pimacs--markdown-render-session-reference-definitions

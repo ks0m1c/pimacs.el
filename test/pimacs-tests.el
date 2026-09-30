@@ -997,6 +997,176 @@
                                (pimacs-section-end section)))))
     (should (= (hash-table-count pimacs--content-sections) 0))))
 
+(ert-deftest pimacs--stream-flush-delay-tracks-render-cost ()
+  (let ((pimacs-stream-render-min-interval 0.01))
+    (let ((pimacs-stream-render-budget nil))
+      (should (= (pimacs--stream-flush-delay) 0)))
+    (let ((pimacs-stream-render-budget 0.5)
+          (pimacs--stream-last-render-cost 0.0))
+      (should (= (pimacs--stream-flush-delay) 0.01)))
+    (let ((pimacs-stream-render-budget 0.5)
+          (pimacs--stream-last-render-cost 0.1))
+      ;; A 50% duty cycle waits as long as the render took.
+      (should (< 0.09 (pimacs--stream-flush-delay) 0.11)))
+    (let ((pimacs-stream-render-budget 0.25)
+          (pimacs--stream-last-render-cost 0.1))
+      ;; A 25% duty cycle waits three times the render cost.
+      (should (< 0.29 (pimacs--stream-flush-delay) 0.31)))))
+
+(defun pimacs-tests--stream-fixture ()
+  (pimacs-section--create-root-section)
+  (setq pimacs--content-sections (make-hash-table :test 'eql))
+  (setq pimacs--tool-calls (make-hash-table :test 'equal))
+  (setq pimacs--bash-executions (make-hash-table :test 'equal))
+  (setq pimacs--prompt-widget (widget-create 'editable-field :format "%v" :value ""))
+  (setq pimacs--stream-pending-events nil
+        pimacs--stream-flush-timer nil
+        pimacs--stream-last-render-cost 0.0)
+  (widget-setup))
+
+(ert-deftest pimacs--handle-message-update-queued-defers-then-flushes ()
+  (with-temp-buffer
+    (pimacs-tests--stream-fixture)
+    (let ((pimacs-stream-render-budget 0.5)
+          rendered)
+      (cl-letf (((symbol-function 'pimacs--handle-message-update)
+                 (lambda (event)
+                   (push (plist-get (plist-get event :assistantMessageEvent) :delta)
+                         rendered))))
+        (pimacs--handle-message-update-queued
+         '((:assistantMessageEvent (:type "text_delta" :delta "a" :contentIndex 0))))
+        (pimacs--handle-message-update-queued
+         '((:assistantMessageEvent (:type "text_delta" :delta "b" :contentIndex 0))))
+        ;; Nothing renders until the queued flush runs.
+        (should-not rendered)
+        (should (timerp pimacs--stream-flush-timer))
+        (pimacs--stream-flush)
+        ;; Consecutive deltas merge into a single render, in order.
+        (should (equal (nreverse rendered) '("ab")))
+        (should-not (timerp pimacs--stream-flush-timer))))))
+
+(ert-deftest pimacs--handle-message-update-queued-is-immediate-without-budget ()
+  (with-temp-buffer
+    (pimacs-tests--stream-fixture)
+    (let ((pimacs-stream-render-budget nil)
+          rendered)
+      (cl-letf (((symbol-function 'pimacs--handle-message-update)
+                 (lambda (event)
+                   (push (plist-get (plist-get event :assistantMessageEvent) :delta)
+                         rendered))))
+        (pimacs--handle-message-update-queued
+         '((:assistantMessageEvent (:type "text_delta" :delta "x" :contentIndex 0))))
+        (should (equal (nreverse rendered) '("x")))
+        (should-not (timerp pimacs--stream-flush-timer))))))
+
+(ert-deftest pimacs--handle-agent-state-flushing-orders-events ()
+  (let (calls)
+    (cl-letf (((symbol-function 'pimacs--stream-flush)
+               (lambda () (push 'flush calls)))
+              ((symbol-function 'pimacs--handle-agent-state)
+               (lambda (_event) (push 'handle calls))))
+      (pimacs--handle-agent-state-flushing '(:type "message_end"))
+      ;; A message update must not flush the stream it belongs to.
+      (pimacs--handle-agent-state-flushing '(:type "message_update"))
+      (should (equal (nreverse calls) '(flush handle handle))))))
+
+(ert-deftest pimacs--stream-queued-renders-same-content-as-direct ()
+  (let ((events '((:assistantMessageEvent
+                   (:type "text_delta" :delta "one " :contentIndex 0)
+                   :message (:role "assistant"))
+                  (:assistantMessageEvent
+                   (:type "text_delta" :delta "**two**" :contentIndex 0)
+                   :message (:role "assistant"))))
+        direct)
+    (with-temp-buffer
+      (pimacs-tests--stream-fixture)
+      (dolist (event events)
+        (pimacs--handle-message-update event))
+      (setq direct (buffer-substring-no-properties (point-min) (point-max))))
+    (with-temp-buffer
+      (pimacs-tests--stream-fixture)
+      (let ((pimacs-stream-render-budget 0.5))
+        (pimacs--handle-message-update-queued events)
+        (pimacs--stream-flush))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     direct)))))
+
+(ert-deftest pimacs--stream-flush-keeps-arrival-order-across-batches ()
+  (with-temp-buffer
+    (pimacs-tests--stream-fixture)
+    (let ((pimacs-stream-render-budget 0.5)
+          seen)
+      (cl-letf (((symbol-function 'pimacs--handle-message-update)
+                 (lambda (event)
+                   (let ((message-event (plist-get event :assistantMessageEvent)))
+                     (push (or (plist-get message-event :delta)
+                               (plist-get message-event :id))
+                           seen)))))
+        (pimacs--handle-message-update-queued
+         '((:assistantMessageEvent (:type "text_delta" :delta "a" :contentIndex 0))))
+        (pimacs--handle-message-update-queued
+         '((:assistantMessageEvent (:type "toolcall_start" :id "t1" :toolName "read"))))
+        (pimacs--handle-message-update-queued
+         '((:assistantMessageEvent (:type "text_delta" :delta "b" :contentIndex 0))))
+        (pimacs--stream-flush)
+        ;; Deltas that are not adjacent stay in arrival order.
+        (should (equal (nreverse seen) '("a" "t1" "b")))))))
+
+(ert-deftest pimacs--stream-flush-applies-toolcall-pair-in-order ()
+  (with-temp-buffer
+    (pimacs-tests--stream-fixture)
+    (let ((pimacs-stream-render-budget 0.5))
+      (pimacs--handle-message-update-queued
+       '((:assistantMessageEvent (:type "toolcall_start" :id "read-1" :toolName "read"))))
+      (pimacs--handle-message-update-queued
+       '((:assistantMessageEvent
+          (:type "toolcall_end"
+                 :toolCall (:id "read-1" :name "read" :arguments (:path "file.el"))))))
+      (pimacs--stream-flush)
+      (let ((entry (gethash "read-1" pimacs--tool-calls)))
+        (should entry)
+        (should (equal (pimacs-tool-call-args entry) '(:path "file.el")))
+        (should (pimacs-tool-call-result-section entry))))))
+
+(ert-deftest pimacs--stream-reset-discards-queued-events ()
+  (with-temp-buffer
+    (pimacs-tests--stream-fixture)
+    (let ((pimacs-stream-render-budget 0.5))
+      (pimacs--handle-message-update-queued
+       '((:assistantMessageEvent (:type "text_delta" :delta "stale" :contentIndex 0))))
+      (should (timerp pimacs--stream-flush-timer))
+      (should pimacs--stream-pending-events)
+      (pimacs--clear-sections)
+      (should-not (timerp pimacs--stream-flush-timer))
+      (should-not pimacs--stream-pending-events)
+      ;; A flush after the reset must not resurrect the discarded deltas.
+      (pimacs--stream-flush)
+      (should-not (pimacs-section-children pimacs-section--root-section))
+      (should (= (hash-table-count pimacs--content-sections) 0)))))
+
+(ert-deftest pimacs--render-operations-delta-start-finds-modified-tail ()
+  (with-temp-buffer
+    (insert "0123456789")
+    (let ((content-end (copy-marker (point-max))))
+      ;; Appends leave the rendered prefix untouched.
+      (should (= (pimacs--render-operations-delta-start content-end '((:append "abc")))
+                 (point-max)))
+      ;; A suffix rewrite reaches back to the replaced characters.
+      (should (= (pimacs--render-operations-delta-start
+                  content-end '((:replace-suffix 3 "xy")))
+                 (- (point-max) 3)))
+      (should (= (pimacs--render-operations-delta-start content-end '((:delete 4)))
+                 (- (point-max) 4)))
+      ;; Operations run in sequence, so a delete can reach before the old end.
+      (should (= (pimacs--render-operations-delta-start
+                  content-end '((:append "abc") (:delete 5)))
+                 (- (point-max) 2)))
+      (should-error (pimacs--render-operations-delta-start content-end '((:bogus))))
+      (should-error (pimacs--render-operations-delta-start content-end '((:append 3))))
+      (should-error (pimacs--render-operations-delta-start content-end '((:delete -1))))
+      (should-error (pimacs--render-operations-delta-start
+                     content-end '((:replace-suffix 1 2)))))))
+
 (ert-deftest pimacs--handle-message-update-batch-merges-compatible-deltas ()
   (let* ((first '(:assistantMessageEvent (:type "text_delta" :delta "a" :contentIndex 0)))
          (events (list first

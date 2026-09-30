@@ -311,6 +311,24 @@ with the message plist to insert the custom message content."
   :type 'boolean
   :group 'pimacs)
 
+(defcustom pimacs-stream-render-budget 0.35
+  "Fraction of wall-clock time that streaming renders may occupy.
+
+Streaming events are coalesced and rendered from a timer.  After a
+render costing C seconds the next one waits long enough to keep the
+long-term duty cycle at or below this fraction, so a large streamed
+message cannot freeze the whole Emacs session while you type.  Set to
+nil to render every event synchronously as it arrives."
+  :type '(choice (const :tag "Render every event" nil)
+                 (number :tag "Wall-clock budget fraction"))
+  :group 'pimacs)
+
+(defcustom pimacs-stream-render-min-interval 0.016
+  "Minimum wall-clock delay between two streaming renders.
+Only used when `pimacs-stream-render-budget' is non-nil."
+  :type 'number
+  :group 'pimacs)
+
 (defvar-local pimacs--project-file-cache nil)
 
 (defun pimacs-clear-project-file-cache ()
@@ -430,12 +448,43 @@ with the message plist to insert the custom message content."
         (cl-incf (pimacs-render-context-rendered-length context)
                  (- (length text) count))))))
 
+(defun pimacs--render-operations-delta-start (content-end operations)
+  "Return the earliest old position modified by the tail OPERATIONS.
+CONTENT-END is the render context end marker before OPERATIONS run.  All
+operations append to, delete from, or rewrite the tail, so the prefix
+before the returned position is unchanged.  Point restoration can be
+scoped to this delta instead of the whole rendered content."
+  (let ((end (marker-position content-end))
+        (start (marker-position content-end)))
+    (dolist (operation operations)
+      (pcase operation
+        (`(:append ,text . ,_)
+         (unless (stringp text)
+           (error "Renderer append operation requires a string: %S" operation))
+         (cl-incf end (length text)))
+        (`(:delete ,count)
+         (unless (and (integerp count) (>= count 0))
+           (error "Renderer delete operation requires a non-negative integer: %S" operation))
+         (setq start (min start (- end count)))
+         (cl-decf end count))
+        (`(:replace-suffix ,count ,text)
+         (unless (and (integerp count) (>= count 0))
+           (error "Renderer replace-suffix operation requires a non-negative integer: %S" operation))
+         (unless (stringp text)
+           (error "Renderer replace-suffix operation requires a string: %S" operation))
+         (setq start (min start (- end count)))
+         (cl-incf end (- (length text) count)))
+        (_
+         (error "Unknown Markdown operation: %S" operation))))
+    start))
+
 (defun pimacs--render-apply-operations (context operations)
-  (let ((content-begin (pimacs-render-context-content-begin context))
-        (content-end (pimacs-render-context-content-end context)))
+  (let* ((content-end (pimacs-render-context-content-end context))
+         (delta-start (pimacs--render-operations-delta-start
+                       content-end operations)))
     (pimacs--with-point-transaction
-        ((marker-position content-begin) (marker-position content-end))
-        ((marker-position content-begin) (marker-position content-end))
+        (delta-start (marker-position content-end))
+        (delta-start (marker-position content-end))
         :align-end
       (dolist (operation operations)
         (pcase operation
@@ -535,6 +584,9 @@ with the message plist to insert the custom message content."
 
 (pimacs--def-permanent-buffer-local pimacs--prompt-widget nil)
 (pimacs--def-permanent-buffer-local pimacs--prompt-detached nil) ; point pinned out of the prompt to hold a scrolled view
+(pimacs--def-permanent-buffer-local pimacs--stream-pending-events nil)
+(pimacs--def-permanent-buffer-local pimacs--stream-flush-timer nil)
+(pimacs--def-permanent-buffer-local pimacs--stream-last-render-cost 0.0)
 (pimacs--def-permanent-buffer-local pimacs--attached-images (vector))
 (pimacs--def-permanent-buffer-local pimacs--attached-images-widget nil)
 (pimacs--def-permanent-buffer-local pimacs--prompt-before-widget nil)
@@ -1045,6 +1097,71 @@ the tail again, move point back to the prompt and resume following."
             (setcar merged-events merged-event))
         (push event merged-events)))
     (nreverse merged-events)))
+
+(defun pimacs--stream-flush-delay ()
+  "Return the wall-clock delay before the next streaming render.
+The delay keeps the long-term rendering duty cycle at
+`pimacs-stream-render-budget' based on the last render cost."
+  (if (null pimacs-stream-render-budget)
+      0
+    (let ((budget (max 0.01 (min 0.99 pimacs-stream-render-budget))))
+      (max pimacs-stream-render-min-interval
+           (* pimacs--stream-last-render-cost (/ (- 1.0 budget) budget))))))
+
+(defun pimacs--stream-flush ()
+  "Render every queued streaming event now, in arrival order."
+  (when (timerp pimacs--stream-flush-timer)
+    (cancel-timer pimacs--stream-flush-timer))
+  (setq pimacs--stream-flush-timer nil)
+  (when pimacs--stream-pending-events
+    (let ((events (pimacs--merge-message-updates
+                   pimacs--stream-pending-events))
+          (start (current-time)))
+      (setq pimacs--stream-pending-events nil)
+      (pimacs--without-undo-before (widget-field-start pimacs--prompt-widget)
+        (dolist (event events)
+          (pimacs--handle-message-update event)))
+      (setq pimacs--stream-last-render-cost
+            (float-time (time-subtract (current-time) start))))))
+
+(defun pimacs--stream-reset ()
+  "Discard queued streaming events and cancel any pending flush."
+  (when (timerp pimacs--stream-flush-timer)
+    (cancel-timer pimacs--stream-flush-timer))
+  (setq pimacs--stream-flush-timer nil
+        pimacs--stream-pending-events nil
+        pimacs--stream-last-render-cost 0.0))
+
+(defun pimacs--stream-schedule-flush ()
+  "Schedule a deferred flush of the queued streaming events."
+  (when (and pimacs-stream-render-budget
+             (not (timerp pimacs--stream-flush-timer)))
+    (let ((buffer (current-buffer)))
+      (setq pimacs--stream-flush-timer
+            (run-with-timer
+             (pimacs--stream-flush-delay) nil
+             (lambda ()
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq pimacs--stream-flush-timer nil)
+                   (pimacs--stream-flush)))))))))
+
+(defun pimacs--handle-message-update-queued (events)
+  "Queue message update EVENTS for a budgeted streaming render.
+Rendering runs from a timer so a burst of deltas cannot monopolize
+the main thread and freeze input.  See `pimacs-stream-render-budget'."
+  (setq pimacs--stream-pending-events
+        (append pimacs--stream-pending-events events))
+  (if pimacs-stream-render-budget
+      (pimacs--stream-schedule-flush)
+    (pimacs--stream-flush)))
+
+(defun pimacs--handle-agent-state-flushing (event)
+  "Flush queued streaming output before handling EVENT.
+Keeps non-message events ordered after the deltas that precede them."
+  (unless (equal (plist-get event :type) "message_update")
+    (pimacs--stream-flush))
+  (pimacs--handle-agent-state event))
 
 (defun pimacs--handle-message-update-batch (events)
   (pimacs--without-undo-before (widget-field-start pimacs--prompt-widget)
@@ -1698,7 +1815,7 @@ is non-nil, insert an ellipsis instead of ARGS."
     ("setTitle" (pimacs--handle-set-title event))))
 
 (defun pimacs--register-event-listeners ()
-  (pimacs--set-event-batch-listener "message_update" 'pimacs #'pimacs--handle-message-update-batch)
+  (pimacs--set-event-batch-listener "message_update" 'pimacs #'pimacs--handle-message-update-queued)
   (pimacs--set-event-listener "message_end" 'pimacs #'pimacs--handle-message-end)
   (pimacs--set-event-listener "bash_execution_update" 'pimacs #'pimacs--handle-bash-execution-update)
 
@@ -1711,7 +1828,7 @@ is non-nil, insert an ellipsis instead of ARGS."
   (pimacs--set-event-listener "queue_update" 'pimacs #'pimacs--handle-queue-update)
   (pimacs--set-event-listener "compaction_end" 'pimacs #'pimacs--handle-compaction-end)
   (pimacs--set-event-listener "extension_ui_request" 'pimacs #'pimacs--handle-extension-ui-request)
-  (pimacs--set-event-listener t 'pimacs #'pimacs--handle-agent-state))
+  (pimacs--set-event-listener t 'pimacs #'pimacs--handle-agent-state-flushing))
 
 (defun pimacs--register-agent-cleanup ()
   "Register a cleanup callback on the agent to kill the chat buffer on exit."
@@ -1789,6 +1906,7 @@ is non-nil, insert an ellipsis instead of ARGS."
 
 (defun pimacs--cleanup-chat-buffer ()
   (let ((project-key pimacs--project-key))
+    (pimacs--stream-reset)
     (remhash project-key pimacs--chats)
     (pimacs--hash-remove-if (lambda (k _v) (equal (car k) project-key)) pimacs--event-listeners)
     (pimacs--hash-remove-if (lambda (k _v) (equal (car k) project-key)) pimacs--event-batch-listeners)
@@ -2398,6 +2516,7 @@ SCOPE, when non-nil, searches resumable sessions across all projects."
 
 (defun pimacs--clear-sections ()
   (pimacs--history-render-reset)
+  (pimacs--stream-reset)
   (dolist (child (copy-sequence (pimacs-section-children pimacs-section--root-section)))
     (pimacs-section--delete-section child))
   (clrhash pimacs--content-sections)

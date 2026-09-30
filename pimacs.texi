@@ -875,6 +875,23 @@ Whether to pop to the chat buffer after sending region, filename or errors.
 Whether to keep the input area at the bottom as new chat content is added.
 @end defopt
 
+@defopt pimacs-stream-render-budget @code{0.35}
+
+Fraction of wall-clock time that streaming renders may occupy.
+
+Streaming events are coalesced and rendered from a timer.  After a
+render costing C seconds the next one waits long enough to keep the
+long-term duty cycle at or below this fraction, so a large streamed
+message cannot freeze the whole Emacs session while you type.  Set to
+nil to render every event synchronously as it arrives.
+@end defopt
+
+@defopt pimacs-stream-render-min-interval @code{0.016}
+
+Minimum wall-clock delay between two streaming renders.
+Only used when @code{pimacs-stream-render-budget} is non-nil.
+@end defopt
+
 @defopt pimacs-search-rg-executable @code{"rg"}
 
 Ripgrep executable used for historical session searches.

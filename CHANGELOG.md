@@ -5,14 +5,18 @@
 ### Added
 
 - `pimacs-copy-section` (`w`) copies the content of the section at point to the kill ring, including tool calls and results.
+- `pimacs-stream-render-budget` and `pimacs-stream-render-min-interval` limit the wall-clock time streamed rendering may occupy, so a fast stream cannot freeze the whole session.
 
 ### Changed
 
 - Session resume candidates now show parent/child relationships as a tree.
+- Render streamed deltas from a coalescing timer instead of once per event.
 
 ### Fixed
 
-- Keep point near the same text when streamed content is re-rendered.
+- Keep point near the same text when streamed content is re-rendered, scoped to the suffix being replaced.
+- Apply queued streamed deltas in arrival order, so tool call start/end pairs stay paired.
+- Drop queued streamed deltas when the chat UI is reset so stale content cannot reappear.
 - Handle JSON `null` values consistently in agent responses and session data.
 - Prevent prefix arguments from leaking into nested chat commands.
 

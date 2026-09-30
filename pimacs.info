@@ -1,4 +1,4 @@
-This is pimacs.info, produced by makeinfo version 7.2 from pimacs.texi.
+This is pimacs.info, produced by makeinfo version 7.3 from pimacs.texi.
 
      Copyright © 2026 Anantha Kumaran.
 
@@ -775,6 +775,21 @@ File: pimacs.info,  Node: Custom Variables,  Next: Custom Faces,  Prev: Keybindi
      Whether to keep the input area at the bottom as new chat content is
      added.
 
+ -- User Option: pimacs-stream-render-budget 0.35
+
+     Fraction of wall-clock time that streaming renders may occupy.
+
+     Streaming events are coalesced and rendered from a timer.  After a
+     render costing C seconds the next one waits long enough to keep the
+     long-term duty cycle at or below this fraction, so a large streamed
+     message cannot freeze the whole Emacs session while you type.  Set
+     to nil to render every event synchronously as it arrives.
+
+ -- User Option: pimacs-stream-render-min-interval 0.016
+
+     Minimum wall-clock delay between two streaming renders.  Only used
+     when ‘pimacs-stream-render-budget’ is non-nil.
+
  -- User Option: pimacs-search-rg-executable "rg"
 
      Ripgrep executable used for historical session searches.
@@ -1284,7 +1299,7 @@ Node: Sandbox17312
 Node: How It Works17705
 Node: Keybindings18857
 Node: Custom Variables23217
-Node: Custom Faces40789
+Node: Custom Faces41450
 
 End Tag Table
 
